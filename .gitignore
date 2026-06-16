@@ -1,0 +1,7 @@
+*.report.json
+copa-report.json
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+.env

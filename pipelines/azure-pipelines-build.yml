@@ -1,0 +1,268 @@
+# =============================================================================
+# Pipeline 2 of 2 - BUILD a container and push to the trusted ACR.
+#
+# SHIFT-LEFT model: the image is built on the agent and scanned by the
+# **Defender for Cloud CLI** BEFORE it is ever pushed. If the scan finds High or
+# Critical vulnerabilities we attempt an automated fix with **Copacetic (copa)**
+# and re-scan. If High/Critical findings remain after patching, the build fails
+# and the image is NEVER pushed. Only a scanned, passing image lands in the
+# trusted repo - then it is signed.
+#
+#   docker build (local)  ->  Defender scan #1
+#        ->  (High/Critical?) -> Copa patch -> Defender scan #2 (hard gate)
+#        ->  push to ACR (only on pass)  ->  Notation sign
+#
+# This is the same scanner Defender uses for ACR, run inline. Contrast with the
+# INGEST pipeline, which consumes a 3rd-party image it cannot rebuild, so it
+# uses a separate quarantine registry + Defender registry scanning instead.
+#
+# Prereqs (see docs/DEMO-WALKTHROUGH.md):
+#   - Defender CSPM enabled on the subscription.
+#   - An Azure DevOps connector onboarded in Defender for Cloud (connector-based
+#     auth, preferred for ADO). Token-based auth via DEFENDER_* secrets also works.
+#   - The MicrosoftDefenderCLI task installed from the Azure DevOps Marketplace.
+# =============================================================================
+trigger:
+  branches: { include: [ main ] }
+  paths: { include: [ app/**, pipelines/azure-pipelines-build.yml ] }
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  # Shared ADO variable group - holds signingKeyId + Defender ingestion creds
+  # (DEFENDER_TENANT_ID, DEFENDER_CLIENT_ID, DEFENDER_CLIENT_SECRET as a secret).
+  # Create once under Pipelines > Library; both pipelines link to it.
+  - group: acr-supplychain-demo
+
+  # ---- set these to match your environment ----
+  - name: azureSubscription
+    value: 'azure-service-connection'  # ADO ARM service connection name
+  - name: acrName
+    value: 'acrdemoregistry0429'                      # ACR resource name (trusted/prod)
+  - name: acrLoginServer
+    value: 'acrdemoregistry0429.azurecr.io'
+  - name: repository
+    value: 'demo/sample-api'
+  - name: tag
+    value: '$(Build.BuildId)'
+  # signing
+  - name: signCertSource
+    value: 'akv'                                      # akv | artifact-signing
+  # signingKeyId comes from the 'acr-supplychain-demo' variable group above. Leave
+  # it unset in the group to skip the Sign stage cleanly.
+
+stages:
+# -----------------------------------------------------------------------------
+# Build + scan + (patch) + push MUST share one job: the locally-built image only
+# exists on this agent. Defender scans it here; Copa patches it here; the push is
+# a LATER step only reached if the (re-)scan passed.
+- stage: BuildScanPush
+  displayName: 'Build -> Defender scan -> Copa patch -> re-scan gate -> push on pass'
+  jobs:
+  - job: build_scan_push
+    timeoutInMinutes: 30
+    variables:
+      localImage: '$(acrLoginServer)/$(repository):$(tag)'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'docker build (local only, NOT pushed yet)'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+          docker build -t "$(localImage)" -f app/Dockerfile app
+          echo "Built $(localImage) locally. Nothing has been pushed to ACR yet."
+
+    # ---- Defender scan #1: capture SARIF and decide whether Copa is needed ----
+    # We do NOT use --defender-break here (it only breaks on Critical). Instead we
+    # parse the SARIF ourselves and gate on High+Critical. Severity lives on the
+    # rule: runs[].tool.driver.rules[ruleIndex].properties.tags contains the label
+    # ("Critical"/"High"/...). Results reference the rule via ruleIndex.
+    #
+    # Token-based auth: set these as SECRET pipeline variables (one-time, from
+    # Defender for Cloud > Environment settings > Integrations > DevOps Ingestion):
+    #   DEFENDER_TENANT_ID, DEFENDER_CLIENT_ID, DEFENDER_CLIENT_SECRET
+    - task: Bash@3
+      displayName: 'Defender for Cloud CLI scan #1 (detect High/Critical)'
+      env:
+        DEFENDER_TENANT_ID: $(DEFENDER_TENANT_ID)
+        DEFENDER_CLIENT_ID: $(DEFENDER_CLIENT_ID)
+        DEFENDER_CLIENT_SECRET: $(DEFENDER_CLIENT_SECRET)
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          echo "==> Auth var presence (lengths only, values never printed):"
+          echo "    DEFENDER_TENANT_ID len=${#DEFENDER_TENANT_ID}  DEFENDER_CLIENT_ID len=${#DEFENDER_CLIENT_ID}  DEFENDER_CLIENT_SECRET len=${#DEFENDER_CLIENT_SECRET}"
+          missing=()
+          [[ -z "${DEFENDER_TENANT_ID:-}"     ]] && missing+=(DEFENDER_TENANT_ID)
+          [[ -z "${DEFENDER_CLIENT_ID:-}"     ]] && missing+=(DEFENDER_CLIENT_ID)
+          [[ -z "${DEFENDER_CLIENT_SECRET:-}" ]] && missing+=(DEFENDER_CLIENT_SECRET)
+          if (( ${#missing[@]} > 0 )); then
+            echo "##vso[task.logissue type=error]Defender ingestion credentials missing/empty: ${missing[*]}"
+            echo "Set them as pipeline variables (DEFENDER_CLIENT_SECRET as a SECRET) from Defender for"
+            echo "Cloud > Environment settings > Integrations > DevOps Ingestion (Preview)."
+            exit 1
+          fi
+          echo "==> Downloading Defender for Cloud CLI"
+          curl -sSL -o defender "https://aka.ms/defender-cli_linux-x64"
+          chmod +x defender
+          mkdir -p "$(Build.ArtifactStagingDirectory)/defender"
+          echo "==> Scanning $(localImage) BEFORE push (scan #1)"
+          ./defender scan image "$(localImage)" \
+            --defender-output "$(Build.ArtifactStagingDirectory)/defender/scan1.sarif"
+          echo "==> Parsing scan #1 for High/Critical"
+          python3 - "$(Build.ArtifactStagingDirectory)/defender/scan1.sarif" <<'PY'
+          import json, sys
+          from collections import Counter
+          run = json.load(open(sys.argv[1]))["runs"][0]
+          rules = run["tool"]["driver"].get("rules", [])
+          def sev(i):
+              return next((t for t in rules[i].get("properties", {}).get("tags", [])
+                           if t in ("Critical", "High", "Medium", "Low")), "Unknown")
+          c = Counter(sev(r["ruleIndex"]) for r in run.get("results", []))
+          hc = c["Critical"] + c["High"]
+          print(f"Scan #1 -> Critical:{c['Critical']} High:{c['High']} Medium:{c['Medium']} Low:{c['Low']}")
+          val = "true" if hc > 0 else "false"
+          print(f"{hc} High/Critical finding(s); needsPatch={val}")
+          print(f"##vso[task.setvariable variable=needsPatch]{val}")
+          PY
+
+    # ---- Copa patch (only if scan #1 found High/Critical) ----
+    # Copacetic patches OS-level packages (dpkg/apk) to remediate known CVEs
+    # without a full base-image rebuild. BuildKit can only read images from a
+    # registry it can reach - it cannot see the Docker daemon's image store, and
+    # the real ACR needs auth. So we stand up a throwaway *local* registry on
+    # localhost:5000, push the locally-built image to it (plain HTTP, no auth -
+    # Docker and BuildKit both treat localhost as insecure by default), and point
+    # Copa at that. Nothing touches the real ACR until the post-gate push.
+    - task: Bash@3
+      displayName: 'Copacetic patch OS vulnerabilities'
+      condition: eq(variables['needsPatch'], 'true')
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          localRef="localhost:5000/$(repository):$(tag)"
+          patchedRef="localhost:5000/$(repository):$(tag)-patched"
+
+          echo "==> Installing Copacetic (latest release)"
+          COPA_TAG=$(curl -sSL https://api.github.com/repos/project-copacetic/copacetic/releases/latest \
+            | grep -oP '"tag_name": "\K[^"]+')
+          echo "    copa ${COPA_TAG}"
+          curl -sSL "https://github.com/project-copacetic/copacetic/releases/download/${COPA_TAG}/copa_${COPA_TAG#v}_linux_amd64.tar.gz" \
+            | tar xz -C /usr/local/bin copa
+
+          echo "==> Starting throwaway local registry + buildkitd (host network)"
+          docker run -d --rm -p 5000:5000 --name copa-reg registry:2
+          # buildkitd needs --network host to reach localhost:5000, and http=true
+          # so it pulls from the local registry over plain HTTP (no TLS/auth).
+          printf '[registry."localhost:5000"]\n  http = true\n' > /tmp/buildkitd.toml
+          docker run -d --rm --privileged --network host --name buildkitd \
+            -v /tmp/buildkitd.toml:/etc/buildkit/buildkitd.toml \
+            --entrypoint buildkitd moby/buildkit:latest
+          sleep 5
+
+          echo "==> Pushing locally-built image to the local registry"
+          docker tag "$(localImage)" "$localRef"
+          docker push "$localRef"
+
+          echo "==> Patching $localRef (update all OS packages)"
+          copa patch -i "$localRef" -t "$(tag)-patched" --addr docker-container://buildkitd
+
+          # Copa loads the patched image back into the Docker daemon as $patchedRef.
+          # Retag it over $(localImage) so the re-scan and push use the patched image.
+          docker tag "$patchedRef" "$(localImage)"
+          docker rm -f buildkitd copa-reg || true
+          echo "Patched image retagged as $(localImage)"
+
+    # ---- Defender scan #2 + HARD GATE (only if we patched) ----
+    # Fails the build (and blocks the push) if any High/Critical remain.
+    - task: Bash@3
+      displayName: 'Defender for Cloud CLI scan #2 (gate on remaining High/Critical)'
+      condition: eq(variables['needsPatch'], 'true')
+      env:
+        DEFENDER_TENANT_ID: $(DEFENDER_TENANT_ID)
+        DEFENDER_CLIENT_ID: $(DEFENDER_CLIENT_ID)
+        DEFENDER_CLIENT_SECRET: $(DEFENDER_CLIENT_SECRET)
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+          echo "==> Re-scanning patched $(localImage) (scan #2)"
+          ./defender scan image "$(localImage)" \
+            --defender-output "$(Build.ArtifactStagingDirectory)/defender/scan2.sarif"
+          echo "==> Gating scan #2 on High/Critical"
+          python3 - "$(Build.ArtifactStagingDirectory)/defender/scan2.sarif" <<'PY'
+          import json, sys
+          from collections import Counter
+          run = json.load(open(sys.argv[1]))["runs"][0]
+          rules = run["tool"]["driver"].get("rules", [])
+          def sev(i):
+              return next((t for t in rules[i].get("properties", {}).get("tags", [])
+                           if t in ("Critical", "High", "Medium", "Low")), "Unknown")
+          c = Counter(sev(r["ruleIndex"]) for r in run.get("results", []))
+          hc = c["Critical"] + c["High"]
+          print(f"Scan #2 -> Critical:{c['Critical']} High:{c['High']} Medium:{c['Medium']} Low:{c['Low']}")
+          if hc:
+              print(f"##vso[task.logissue type=error]{hc} High/Critical vulnerabilities remain after Copa patch")
+              sys.exit(1)
+          print("No High/Critical findings after patch - gate passed")
+          PY
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Defender SARIF (scan #1 + scan #2)'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/defender'
+        ArtifactName: 'defender-sarif'
+
+    - task: AzureCLI@2
+      displayName: 'Push to trusted ACR (only reached if the scan gate passed)'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+          az acr login -n "$(acrName)"
+          docker push "$(localImage)"
+          echo "Pushed $(localImage) - this image is scanned and passing."
+
+# -----------------------------------------------------------------------------
+- stage: Sign
+  displayName: 'Sign: Notation (proves it passed our controls)'
+  dependsOn: BuildScanPush
+  condition: succeeded()
+  jobs:
+  - job: sign
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Notation sign the scanned image'
+      condition: ne(variables['signingKeyId'], '')
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+          # Release asset names embed the version (notation_<ver>_linux_amd64.tar.gz),
+          # so resolve it - the versionless latest/download/ path 404s.
+          NOTATION_VER=$(curl -fsSL https://api.github.com/repos/notaryproject/notation/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')
+          curl -fsSL "https://github.com/notaryproject/notation/releases/download/v${NOTATION_VER}/notation_${NOTATION_VER}_linux_amd64.tar.gz" | tar xz -C /usr/local/bin notation
+          # Install the azure-kv signing plugin from a downloaded file. `--url`
+          # installs require a --sha256sum, but `--file` installs do not, so this
+          # avoids pinning a checksum that changes on every plugin release.
+          AKV_VER=$(curl -fsSL https://api.github.com/repos/Azure/notation-azure-kv/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')
+          curl -fsSLo /tmp/notation-azure-kv.tar.gz "https://github.com/Azure/notation-azure-kv/releases/download/v${AKV_VER}/notation-azure-kv_${AKV_VER}_linux_amd64.tar.gz"
+          notation plugin install --file /tmp/notation-azure-kv.tar.gz
+          notation plugin ls
+          az acr login -n "$(acrName)"
+          chmod +x scripts/sign-image.sh
+          scripts/sign-image.sh "$(acrLoginServer)" "$(repository)" "$(tag)" "$(signCertSource)" "$(signingKeyId)"
+    - script: echo "signingKeyId is blank - skipping signing. Set it to enable the trust chain."
+      condition: eq(variables['signingKeyId'], '')
+      displayName: 'Signing skipped (no key configured)'
