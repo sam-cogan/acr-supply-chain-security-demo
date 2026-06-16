@@ -15,28 +15,23 @@ It shows two Azure DevOps pipelines with **two complementary gate models**, both
 
 ## The control flow
 
-```
- BUILD (our code)
-   docker build (local) → Defender for Cloud CLI scan (break=true)
-        │ fail → STOP (never pushed)
-        ▼ pass
-   push → trusted ACR → sign → AKS
+```mermaid
+flowchart TD
+    subgraph BUILD["BUILD (our code)"]
+        B1["docker build (local)"] --> B2["Defender for Cloud CLI scan<br/>(break=true)"]
+        B2 -->|fail| B3["STOP (never pushed)"]
+        B2 -->|pass| B4["push → trusted ACR"]
+        B4 --> B5["Notation sign"]
+        B5 --> B6["AKS"]
+    end
 
- INGEST (3rd-party image)
-   az acr import → ┌──────────────────────────┐
-   QUARANTINE ACR  │ Microsoft Defender for    │
-   (no AKS access) │ Containers  (THE GATE)    │
-                   └───────────┬──────────────┘
-                               │ findings > Medium?
-                               ▼
-                   ┌──────────────────────────┐
-                   │ Copacetic (copa)          │  Trivy feeds Copa here only
-                   │ patch OS CVEs, no rebuild │  (not the gate)
-                   └───────────┬──────────────┘
-                               ▼  re-scan w/ Defender
-                   promote → golden repo (trusted ACR) → Notation sign
-                               ▼
-                   AKS admission (Ratify + Azure Policy Deny)
+    subgraph INGEST["INGEST (3rd-party image)"]
+        I1["az acr import →<br/>QUARANTINE ACR<br/>(no AKS access)"] --> I2["Microsoft Defender for Containers<br/>(THE GATE)"]
+        I2 -->|findings &gt; Medium| I3["Copacetic (copa)<br/>patch OS CVEs, no rebuild<br/><i>Trivy feeds Copa here only, not the gate</i>"]
+        I3 -->|re-scan w/ Defender| I4["promote → golden repo (trusted ACR)"]
+        I4 --> I5["Notation sign"]
+        I5 --> I6["AKS admission<br/>(Ratify + Azure Policy Deny)"]
+    end
 ```
 
 ## Components
