@@ -12,15 +12,10 @@
 #        ->  (High/Critical?) -> Copa patch -> Defender scan #2 (hard gate)
 #        ->  push to ACR (only on pass)  ->  Notation sign
 #
-# This is the same scanner Defender uses for ACR, run inline. Contrast with the
-# INGEST pipeline, which consumes a 3rd-party image it cannot rebuild, so it
-# uses a separate quarantine registry + Defender registry scanning instead.
-#
 # Prereqs (see docs/DEMO-WALKTHROUGH.md):
 #   - Defender CSPM enabled on the subscription.
 #   - An Azure DevOps connector onboarded in Defender for Cloud (connector-based
 #     auth, preferred for ADO). Token-based auth via DEFENDER_* secrets also works.
-#   - The MicrosoftDefenderCLI task installed from the Azure DevOps Marketplace.
 # =============================================================================
 trigger:
   branches: { include: [ main ] }

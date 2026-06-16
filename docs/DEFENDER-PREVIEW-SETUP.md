@@ -1,41 +1,34 @@
-# Enabling the Defender for Cloud CLI gate (BUILD pipeline)
+# Enabling the Defender for Cloud CLI gate
 
-The **BUILD** pipeline (`pipelines/azure-pipelines-build.yml`) scans the locally
-built image with the **Microsoft Defender for Cloud CLI** *before* it is pushed
-to ACR. The CLI must authenticate to Defender for Cloud to upload findings and
-return a gating exit code. That authentication is a **one-time manual setup in
-the Azure portal** — it cannot be scripted/automated from the pipeline, because
-the credentials are generated interactively in the Defender for Cloud UI.
+Both pipelines scan the local image (built or pulled) with the **Microsoft
+Defender for Cloud CLI** before it is pushed to ACR. The CLI authenticates to
+Defender for Cloud to upload findings and return a gating exit code. That
+authentication is a one-time setup in the Azure portal.
 
-> Status today: the build pipeline fails at *"Defender ingestion credentials are
-> not set"* because neither auth method below has been configured yet. The
-> INGEST pipeline is unaffected (it uses Defender **registry** scanning, not the
-> CLI).
-
-Pick **one** of the two methods. **Connector-based is preferred** (no secrets in
-the pipeline).
+Pick **one** of the two methods. Connector-based requires no secrets in the
+pipeline.
 
 ---
 
 ## Prerequisites (both methods)
 
 - Defender for Cloud onboarded on the subscription.
-- **Defender CSPM** plan enabled. *(Already enabled in this environment.)*
+- **Defender CSPM** plan enabled.
 - Permission to edit Defender **Environment settings** (Security Admin / Owner).
 
 ---
 
-## Option A — Connector-based auth (preferred, no secrets)
+## Option A — Connector-based auth (no secrets)
 
-Integrates Azure DevOps directly with Defender via a secure connector; the CLI
-then authenticates automatically with **no `DEFENDER_*` variables required**.
+Integrates Azure DevOps with Defender via a connector; the CLI authenticates
+automatically with no `DEFENDER_*` variables required.
 
 1. Azure portal → **Microsoft Defender for Cloud** → **Environment settings**.
 2. **+ Add environment** → **Azure DevOps**.
 3. Authorize and select the ADO organization (`<your-ado-org>`) and the
    **<your-project>** project.
 4. Finish onboarding and wait for the connector to show **Connected**.
-5. Re-run the BUILD pipeline — the `defender scan image` step authenticates via
+5. Re-run the pipeline — the `defender scan image` step authenticates via
    the connector automatically.
 
 Docs: <https://learn.microsoft.com/azure/defender-for-cloud/quickstart-onboard-devops>
@@ -61,9 +54,9 @@ pipeline variables**.
 
 Docs: <https://learn.microsoft.com/azure/defender-for-cloud/defender-cli-authentication>
 
-### 2. Add them as SECRET variables on the BUILD pipeline (ADO)
+### 2. Add them as SECRET variables on the pipeline (ADO)
 
-ADO → **Pipelines** → *ACR - Build (scan before push)* → **Edit** →
+ADO → **Pipelines** → select the pipeline → **Edit** →
 **Variables** (or a linked Variable Group), add — each marked **🔒 Keep this
 value secret**:
 
@@ -85,24 +78,17 @@ env:
 
 ### 3. Re-run
 
-Re-run the BUILD pipeline. The gate downloads the CLI from
+Re-run the pipeline. The gate downloads the CLI from
 `https://aka.ms/defender-cli_linux-x64`, scans the local image, and fails the
 build (preventing the push) if breaking findings are found (`breakOnFindings`).
 
 ---
 
-## Notes / caveats
+## Notes
 
-- **Preview feature.** *DevOps Ingestion (Preview)* and CI/CD CLI scanning are in
-  public preview; portal navigation and exact labels may change.
-- **Token expiry.** Token-based secrets expire on the date you set — rotate them
-  before expiry or the gate starts failing again. Connector-based auth avoids
-  this entirely.
-- **Marketplace task not used.** This pipeline intentionally downloads the
-  official Defender CLI binary directly instead of the `MicrosoftDefenderCLI`
-  marketplace task, which is **not installable** in this org.
-- **Unrelated latent bug:** the BUILD pipeline's *Sign* stage still downloads
-  Notation from a versionless `releases/latest/download/...` URL, which 404s
-  (same class of bug already fixed in the INGEST pipeline). It only runs when a
-  `signingKeyId` is supplied, so it isn't hit today — fix it before enabling
-  signing on the build side.
+- *DevOps Ingestion (Preview)* and CI/CD CLI scanning are in public preview;
+  portal navigation and exact labels may change.
+- Token-based secrets expire on the date you set — rotate them before expiry.
+  Connector-based auth avoids this.
+- The pipelines download the Defender CLI binary directly rather than using the
+  `MicrosoftDefenderCLI` marketplace task.

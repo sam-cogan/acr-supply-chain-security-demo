@@ -2,10 +2,8 @@
 #
 # copa-patch.sh — Patch OS-level CVEs in-place with Copacetic (no rebuild).
 #
-# Copa requires a vulnerability report from a scanner. Trivy is the canonical
-# Copa input and is used HERE ONLY to feed Copa — the security *gate* in this
-# demo is Microsoft Defender for Containers (see defender-gate.sh). Copa fixes
-# Linux OS-package CVEs; app/language CVEs must still be fixed at build.
+# Copa requires a vulnerability report from a scanner; Trivy produces that
+# report. Copa fixes Linux OS-package CVEs; app/language CVEs are fixed at build.
 #
 # Usage:
 #   copa-patch.sh <acrLoginServer> <repository> <tag> [patchedTag]

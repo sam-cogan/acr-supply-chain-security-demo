@@ -1,33 +1,23 @@
 # =============================================================================
 # Pipeline 1 of 2 - INGEST a third-party image into your registry estate.
 #
-# Use case: you want to consume an upstream image (Docker Hub, MCR, a vendor)
-# but it must NOT go straight into your trusted registry until it has been
-# scanned and remediated.
-#
-# Same engine as the BUILD pipeline: the image is pulled to the agent and
-# scanned inline with the **Defender for Cloud CLI** BEFORE it is ever pushed. If
-# the scan finds High/Critical vulnerabilities we attempt an automated fix with
-# **Copacetic (copa)** and re-scan. If High/Critical findings remain after
-# patching, the build fails and the image is NEVER pushed. Only a scanned,
-# passing image lands in the trusted repo - then it is signed.
+# The upstream image (Docker Hub, MCR, a vendor) is pulled to the agent and
+# scanned inline with the **Defender for Cloud CLI** before it is pushed. If the
+# scan finds High/Critical vulnerabilities, Copacetic (copa) attempts a patch
+# and the image is re-scanned. If High/Critical findings remain after patching,
+# the build fails and the image is not pushed. Only a scanned, passing image
+# lands in the trusted repo, then it is signed.
 #
 #   docker pull (upstream)  ->  Defender scan #1
 #        ->  (High/Critical?) -> Copa patch -> Defender scan #2 (hard gate)
 #        ->  push to trusted ACR (only on pass)  ->  Notation sign
-#
-# This is the inline-CLI model (the agent pulls and scans a local image), the
-# same shift-left control the BUILD pipeline uses - no agentless registry
-# scanning and no separate quarantine ACR. The untrusted upstream image only
-# ever exists on the ephemeral agent until it has passed the gate; nothing is
-# pushed to any registry until scan #2 is clean.
 #
 # Prereqs (see docs/DEMO-WALKTHROUGH.md):
 #   - Defender CSPM enabled on the subscription.
 #   - An Azure DevOps connector onboarded in Defender for Cloud (connector-based
 #     auth, preferred for ADO). Token-based auth via DEFENDER_* secrets also works.
 # =============================================================================
-trigger: none          # run manually / on a schedule - ingest is deliberate
+trigger: none          # run manually / on a schedule
 
 parameters:
 - name: sourceImage
